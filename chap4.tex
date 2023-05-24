@@ -1,0 +1,104 @@
+\chapter{Software Model}
+To perform design space exploration, a software model written C++ language is provided with the generator. The generator can be then exercised with this software model without performing costlier and longer RTL simulations. In addition, a software model can be used to find bottlenecks in the system and optimize the RTL based on the findings. Parameterization of the RTL modules in a software model is much more intuitive which allows for fast iterations on multiple parameters for a specific design without elaborating the SoC and controller RTL. 
+\section{Cycle Information}
+It is important to model the controller with clock and cycle information so that a possible bottleneck in the system can be found. In the software model, we added a \verb|Clock| class to model the system using an object of the \verb|Clock|. A \verb|Clock| object provides the API necessary to set the clock to a certain cycle, and tick the clock. The \verb|Clock| API is shown below.
+\begin{verbatim}
+class Clock {
+private:
+  std::string clock_name;
+  uint64_t cycle;
+public:
+  Clock(std::string name);
+  void set_to_cycle(uint64_t cc);
+  uint64_t get_cycle();
+  void tick();
+};
+\end{verbatim}
+Using clock objects allows us to output the progress of transactions with the cycle information.
+\section{Issuers}
+A \verb|TransactionIssuer| is used to model software running on the system. Since the software model does not exactly need to adhere to the specific hardware protocols, we can avoid detailed signals within a TileLink packet and summarize a transaction as below:
+
+\begin{verbatim}
+enum TXType {
+  read, 
+  write
+};
+
+typedef struct Transaction {
+  uint64_t id;
+  uint64_t address;
+  uint32_t sourceId;
+  uint8_t bank;
+  TXType opcode;
+  std::vector<uint64_t> data;
+  uint64_t mask;
+} Transaction;
+\end{verbatim}
+A \verb|TransactionIssuer| is a c++ class that can read transactions from a provided transaction stream in a text format. The object can also generate random transactions and issue them to the controller.
+The \verb|TransactionIssuer| interface is as shown below:
+\begin{verbatim}
+class TransactionIssuer {
+private:
+  std::string name;
+  uint16_t sourceId;
+  std::map<uint64_t, Transaction*> awaiting;
+  std::map<uint64_t, Transaction*> processed;
+public:
+  TransactionIssuer(std::string this_name, uint16_t sid);
+  std::string get_name();
+  uint16_t get_source_id();
+  std::map<uint64_t, Transaction*> get_awaiting_tx();
+  Transaction* get_random_tx(uint64_t cycle);
+  void read_tx_from_file(std::string f);
+\end{verbatim}
+The awaiting and processed fields can be used to monitor the progress of the controller on issuing the transactions and the responses from the DRAM software model. 
+\section{Dram Memory Model}
+A simple memory model would suffice for this software model as the purpose of this model is to realize the functionality and performance of the memory controller. Therefore, a zero-latency model for memory transactions can be used. A simple mapping of addresses to 256-bit values with an additional map to keep track of the state of each row is used for modeling a bank in the DRAM device. The \verb|Bank| class is defined with core functionalities and zero latencies for all the commands: 
+\begin{verbatim}
+
+class Bank {
+private:
+  State state;
+  uint64_t active_row;
+  uint8_t bank;
+  std::map<uint64_t, DramData*> mem;
+public: 
+  Bank(uint8_t i) {
+    bank = i;
+    state = IDLE;
+  }
+  void activate(uint64_t addr);
+  void precharge();
+  void refresh();
+  DramData* read_cas(uint64_t addr, bool auto_pre);
+  void write_cas(uint64_t addr, DramData *data, bool auto_pre);
+};
+\end{verbatim}
+A full DRAM model uses the Bank class and instantiates eight banks. It then exposes the same methods and dispatches the calls to the corresponding bank based on the address. As an example, the activate method in the \verb|DramModel| extracts the bank bits from the address and then dispatchers the \verb|activate| call to the corresponding bank.
+\begin{verbatim}
+class DramModel {
+private:
+  uint64_t capacity;
+  Bank *banks[8];
+  uint8_t get_bank_from_addr(uint64_t addr) {
+    return (uint8_t)(addr & (7 << 9));
+  }
+  uint64_t no_bank_bits(uint64_t addr);
+public:
+  DramModel(uint64_t cap);
+  void activate(uint64_t addr) {
+    uint8_t bn = get_bank_from_addr(addr);
+    banks[bn]->activate(no_bank_bits(addr));
+  }
+  void precharge_all_banks();
+  void precharge(uint64_t addr);
+  void refresh_all_banks();
+  DramData* read_cas(uint64_t addr, bool auto_pre);
+  void write_cas(uint64_t addr, DramData *data, bool auto_pre);
+};
+\end{verbatim}
+The above API can perform the main commands of the DRAM. We avoided the implementation of complete JEDEC accurate commands since this model is not used for verification purposes of the controller.
+\section{Core Model}
+The Core model consists of the wrapper class around the eight Bank Machine classes with a command chooser and the multiplexer. A cycle per cycle function calls to the \verb|fsm| function of each Bank Machine object would trigger them to process a command and return a possible command if the timing parameters are met. The timing parameters are implemented as variables that are modified by the \verb|fsm| function. On each cycle, if there exists a command that meets the timings and can be issued, the \verb|fsm| method of the Bank Machine returns the corresponding Bank Output structure. The structures implemented in the software model have the same fields as the bundles in our RTL. 
+
+A command selection logic uses a round-robin implementation in software and picks between one of the possible eight outputs from the \verb|fsm| method of each Bank Machine. The output of the Core object then is multiplexed with the other controllers such as the refresh controller and then sent out to the DRAM memory model.
